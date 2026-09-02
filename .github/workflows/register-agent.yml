@@ -73,12 +73,15 @@ jobs:
             -H "OData-Version: 4.0" \
             -H "Content-Type: application/json" \
             -H "Authorization: Bearer ${{ steps.blueprinttoken.outputs.token }}" \
-            -d '{
-                  "displayName": "Contoso Sales Assistant Agent",
-                  "agentIdentityBlueprintId": "'"${BLUEPRINT_APP_ID}"'"
-                  "sponsors@odata.bind": ["https://graph.microsoft.com/v1.0/groups/'"${AGENT_SPONSOR_GROUP_ID}"'"]
-
-                }')
+            -d "$(jq -n \
+              --arg displayName "Contoso Sales Assistant Agent" \
+              --arg blueprintId "$BLUEPRINT_APP_ID" \
+              --arg sponsorId "$AGENT_SPONSOR_GROUP_ID" \
+              '{
+                displayName: $displayName,
+                agentIdentityBlueprintId: $blueprintId,
+                "sponsors@odata.bind": ["https://graph.microsoft.com/v1.0/groups/" + $sponsorId]
+              }')")
           echo "$RESP"
           IDENTITY_ID=$(echo "$RESP" | jq -r '.id')
           if [ "$IDENTITY_ID" = "null" ] || [ -z "$IDENTITY_ID" ]; then
