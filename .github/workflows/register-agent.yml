@@ -13,6 +13,7 @@ env:
   TENANT_ID: ${{ vars.TENANT_ID }}
   BLUEPRINT_APP_ID: ${{ vars.AGENT_BLUEPRINT_APP_ID }}
   BLUEPRINT_OBJECT_ID: ${{ vars.AGENT_BLUEPRINT_OBJECT_ID }}
+  AGENT_SPONSOR_GROUP_ID: ${{ vars.AGENT_SPONSOR_GROUP_ID }}
   GRAPH_BASE: https://graph.microsoft.com
 
 jobs:
@@ -75,6 +76,8 @@ jobs:
             -d '{
                   "displayName": "Contoso Sales Assistant Agent",
                   "agentIdentityBlueprintId": "'"${BLUEPRINT_APP_ID}"'"
+                  "sponsors@odata.bind": ["https://graph.microsoft.com/v1.0/groups/'"${AGENT_SPONSOR_GROUP_ID}"'"]
+
                 }')
           echo "$RESP"
           IDENTITY_ID=$(echo "$RESP" | jq -r '.id')
