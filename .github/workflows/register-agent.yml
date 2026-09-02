@@ -1,0 +1,116 @@
+name: Register and activate agent identity
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+
+permissions:
+  id-token: write   # required to request the GitHub OIDC token
+  contents: read
+
+env:
+  TENANT_ID: ${{ vars.TENANT_ID }}
+  BLUEPRINT_APP_ID: ${{ vars.AGENT_BLUEPRINT_APP_ID }}
+  BLUEPRINT_OBJECT_ID: ${{ vars.AGENT_BLUEPRINT_OBJECT_ID }}
+  GRAPH_BASE: https://graph.microsoft.com
+
+jobs:
+  register-agent:
+    runs-on: ubuntu-latest
+    environment: production   # must match the FIC 'subject' IAM configured on the blueprint
+    steps:
+
+      - name: Get GitHub OIDC token
+        id: idtoken
+        run: |
+          IDTOKEN=$(curl -sLS -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+            "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=api://AzureADTokenExchange" | jq -r '.value')
+          echo "::add-mask::$IDTOKEN"
+          echo "idtoken=$IDTOKEN" >> "$GITHUB_OUTPUT"
+
+      - name: Exchange OIDC token for a blueprint access token (federated credential path)
+        id: blueprinttoken
+        run: |
+          RESP=$(curl -sLS -X POST \
+            "https://login.microsoftonline.com/${TENANT_ID}/oauth2/v2.0/token" \
+            -d "client_id=${BLUEPRINT_APP_ID}" \
+            -d "scope=https://graph.microsoft.com/.default" \
+            -d "client_assertion_type=urn:ietf:params:oauth:client-assertion-type:jwt-bearer" \
+            -d "client_assertion=${{ steps.idtoken.outputs.idtoken }}" \
+            -d "grant_type=client_credentials")
+          TOKEN=$(echo "$RESP" | jq -r '.access_token')
+          if [ "$TOKEN" = "null" ] || [ -z "$TOKEN" ]; then
+            echo "::error::Token exchange failed. Response: $RESP"
+            exit 1
+          fi
+          echo "::add-mask::$TOKEN"
+          echo "token=$TOKEN" >> "$GITHUB_OUTPUT"
+
+      # --- Alternative: client-secret path (only if IAM issued a fallback secret
+      #     instead of / in addition to a federated credential). Comment out the
+      #     step above and uncomment this one if you're not using the FIC.
+      #
+      # - name: Get blueprint access token (client secret path)
+      #   id: blueprinttoken
+      #   run: |
+      #     RESP=$(curl -sLS -X POST \
+      #       "https://login.microsoftonline.com/${TENANT_ID}/oauth2/v2.0/token" \
+      #       -d "client_id=${BLUEPRINT_APP_ID}" \
+      #       -d "client_secret=${{ secrets.AGENT_BLUEPRINT_SECRET }}" \
+      #       -d "scope=https://graph.microsoft.com/.default" \
+      #       -d "grant_type=client_credentials")
+      #     TOKEN=$(echo "$RESP" | jq -r '.access_token')
+      #     echo "::add-mask::$TOKEN"
+      #     echo "token=$TOKEN" >> "$GITHUB_OUTPUT"
+
+      - name: Create the agent identity from the blueprint
+        id: createidentity
+        run: |
+          RESP=$(curl -sLS -X POST \
+            "${GRAPH_BASE}/beta/serviceprincipals/Microsoft.Graph.AgentIdentity" \
+            -H "OData-Version: 4.0" \
+            -H "Content-Type: application/json" \
+            -H "Authorization: Bearer ${{ steps.blueprinttoken.outputs.token }}" \
+            -d '{
+                  "displayName": "Contoso Sales Assistant Agent",
+                  "agentIdentityBlueprintId": "'"${BLUEPRINT_APP_ID}"'"
+                }')
+          echo "$RESP"
+          IDENTITY_ID=$(echo "$RESP" | jq -r '.id')
+          if [ "$IDENTITY_ID" = "null" ] || [ -z "$IDENTITY_ID" ]; then
+            echo "::error::Agent identity creation failed. Response: $RESP"
+            exit 1
+          fi
+          echo "identity_id=$IDENTITY_ID" >> "$GITHUB_OUTPUT"
+
+      - name: Register the agent card (bring it online in the Agent 365 registry)
+        run: |
+          curl -sLS -X POST \
+            "${GRAPH_BASE}/beta/copilot/agentRegistrations" \
+            -H "Content-Type: application/json" \
+            -H "Authorization: Bearer ${{ steps.blueprinttoken.outputs.token }}" \
+            -d '{
+                  "displayName": "Contoso Sales Assistant Agent",
+                  "description": "Assists reps with CRM lookups, email, calendar invites, and Teams notifications",
+                  "createdBy": "'"${BLUEPRINT_APP_ID}"'",
+                  "sourceCreatedDateTime": "'"$(date -u +%Y-%m-%dT%H:%M:%SZ)"'",
+                  "sourceLastModifiedDateTime": "'"$(date -u +%Y-%m-%dT%H:%M:%SZ)"'",
+                  "agentIdentityId": "'"${{ steps.createidentity.outputs.identity_id }}"'",
+                  "agentIdentityBlueprintId": "'"${BLUEPRINT_OBJECT_ID}"'",
+                  "agentCard": {
+                    "name": "Contoso Sales Assistant Agent",
+                    "version": "1.0.0",
+                    "description": "Assists reps with CRM lookups, email, calendar invites, and Teams notifications",
+                    "provider": "Contoso",
+                    "capabilities": { "streaming": false, "pushNotifications": false },
+                    "defaultInputModes": ["text"],
+                    "defaultOutputModes": ["text"],
+                    "skills": [
+                      { "id": "crm-lookup", "name": "CRM Lookup", "description": "Look up customer and deal records" },
+                      { "id": "email", "name": "Email", "description": "Read and send email on behalf of the agent" },
+                      { "id": "calendar", "name": "Calendar", "description": "Send calendar invites" },
+                      { "id": "teams-notify", "name": "Teams Notifications", "description": "Send Teams activity notifications" }
+                    ]
+                  }
+                }'
