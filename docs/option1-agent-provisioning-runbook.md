@@ -78,6 +78,18 @@ Authorization: Bearer <iam-team-token>
 
 Preferred for a pipeline that runs in GitHub Actions: trust GitHub's OIDC issuer directly, so no long-lived secret ever leaves Entra. This is created in addition to the client secret below, per your process — treat the FIC as the credential the pipeline should use, and the secret as a locked-down fallback for local testing only.
 
+**How a FIC differs from a secret — this trips people up, so worth being explicit:**
+
+A **client secret** is a literal shared password. Whoever holds the string can authenticate as the app, from anywhere, until it's rotated or expires. It has to be generated once and then handed to the developer over some secure channel — which is exactly the kind of secret-handoff problem this whole "maximum separation of duties" design is trying to avoid.
+
+A **federated identity credential (FIC) is not a secret at all** — there's no string to hand over. It's a *trust rule* configured entirely on the Entra side: "accept a token as proof of identity if it was signed by GitHub's OIDC issuer AND its claims match this pattern (a specific repo + environment)." Nothing secret ever leaves Entra, and nothing secret is ever handed to the developer:
+
+- IAM configures the FIC once, using only the developer's repo name/owner and environment name — information, not a credential.
+- At runtime, GitHub itself signs a short-lived token asserting "this came from `davisanc/agent-identity-demo`, environment `production`" — the developer's pipeline never sees or stores a Microsoft credential of any kind.
+- Entra checks the signature and the claims against the FIC rule and issues an access token if they match.
+
+**What actually protects the blueprint isn't secrecy of the App ID/Object ID/Tenant ID — those are effectively public within the tenant.** It's that only GitHub can mint a validly-signed token whose `sub`/`repository_id` claims match *this specific repo*. Someone else's GitHub repo, however configured, produces a token with *their* repository_id — which the FIC rule rejects outright (`AADSTS700213`), regardless of whether they know the blueprint's identifiers. The trust boundary is "who controls this exact repo + environment," not "who knows these IDs."
+
 ```http
 POST https://graph.microsoft.com/v1.0/applications/<blueprint-object-id>/federatedIdentityCredentials
 OData-Version: 4.0
@@ -93,6 +105,38 @@ Authorization: Bearer <iam-team-token>
 ```
 
 Adjust `subject` to match how the developer's workflow will run — e.g. `repo:<org>/<repo>:ref:refs/heads/main` for a branch, or `repo:<org>/<repo>:environment:<name>` for a protected GitHub Environment (recommended, since it lets IAM require manual approval on the GitHub side too).
+
+**⚠️ GitHub immutable subject claims (repos created on/after July 15, 2026):** since that date, GitHub embeds immutable numeric owner/repo IDs into the `sub` claim by default — `repo:<owner>@<ownerId>/<repo>@<repoId>:...` instead of the plain name-based format above. A FIC built with the flat `subject` field and a name-based value will fail with `AADSTS700213: No matching federated identity record found` on any repo created after that cutoff. For those repos, use `claimsMatchingExpression` instead of `subject`. Entra requires this expression to include **both** `sub` (wildcarded) **and** `repository_id` explicitly — a `sub`-only expression is rejected with `InvalidFederatedIdentityCredentialValue: lacks all required claims`:
+
+```http
+POST https://graph.microsoft.com/v1.0/applications/<blueprint-object-id>/federatedIdentityCredentials
+Content-Type: application/json
+Authorization: Bearer <iam-team-token>
+
+{
+  "name": "github-actions-oidc",
+  "issuer": "https://token.actions.githubusercontent.com",
+  "claimsMatchingExpression": {
+    "value": "claims['sub'] matches 'repo:*:environment:production' and claims['repository_id'] eq '<repo-id>'",
+    "languageVersion": 1
+  },
+  "audiences": ["api://AzureADTokenExchange"]
+}
+```
+
+**Security note on the `repo:*` wildcard:** on its own, `repo:*` would match a token from *any* repo. It's the `and claims['repository_id'] eq '<repo-id>'` clause doing the actual scoping — `repository_id` is unique and immutable to your one specific repo, so the wildcard is safe only because it's constrained by that second clause. Confirm both clauses actually made it into whatever the final accepted expression is; a `sub`-wildcard without the `repository_id` constraint would genuinely open the door to any repo with an environment named `production`, from any account.
+
+Get the exact `sub` value (and therefore the repo/owner IDs) from the actual error message on a failed first run, or from the workflow's own OIDC token — don't guess it. `claimsMatchingExpression` and `subject` are mutually exclusive on the same credential; use one or the other, not both.
+
+**Fallback, if `claimsMatchingExpression` is rejected entirely:** use `subject` with the exact literal immutable-format string from the error (no wildcard available in this form, so it's tied to this repo's current name too, not just its ID):
+```json
+{
+  "name": "github-actions-oidc",
+  "issuer": "https://token.actions.githubusercontent.com",
+  "subject": "repo:davisanc@13849920/agent-identity-demo@1354912862:environment:production",
+  "audiences": ["api://AzureADTokenExchange"]
+}
+```
 
 ### Step 1.4 — Add a client secret (fallback / local dev only)
 
@@ -184,12 +228,17 @@ GET https://graph.microsoft.com/v1.0/applications/<blueprint-object-id>/microsof
 
 ### Step 1.6 — Hand off to the developer over a secure channel
 
-Deliver **only**:
+**What's actually a secret here, and what isn't:**
+- Blueprint **App ID** (`appId`) and **Object ID** (`id`) are **identifiers, not secrets** — they're needed to configure the pipeline (which app to authenticate as), but knowing them alone gives no ability to authenticate as the blueprint. They're the equivalent of a username, not a password.
+- The **federated credential itself never needs handing over at all** — there's no string representing it. IAM configures it once (Step 1.3) using only the developer's repo/environment name; from then on, GitHub mints the proof of identity at runtime and Entra validates it against that rule. The developer's pipeline authenticates without ever holding a Microsoft credential of any kind.
+- The **fallback client secret** (if issued at all — Step 1.4) is the one genuine secret in this handoff. If the FIC path works, this ideally never needs to leave the vault it's stored in.
+
+Deliver:
 - Blueprint **App ID** (`appId`)
 - Blueprint **Object ID** (`id`)
 - Fallback client secret (if issued)
 
-via a secrets vault (Key Vault, GitHub encrypted environment secret pushed by IAM, PIM-protected sharing) — never email, chat, or a ticket. The developer's GitHub Actions workflow will authenticate as the blueprint using the federated credential from Step 1.2, so the secret ideally never needs to touch GitHub at all.
+via a secrets vault (Key Vault, GitHub encrypted environment secret pushed by IAM, PIM-protected sharing) — never email, chat, or a ticket. Even though the App ID/Object ID aren't sensitive on their own, routing everything through the same secure channel avoids needing two different handoff processes depending on sensitivity.
 
 ### Step 1.7 — Global Administrator grants tenant-wide admin consent
 
@@ -215,9 +264,12 @@ The developer never authenticates as themselves against Entra for this. Their wo
 
 ### 2.1 — Repo setup
 
-- Store the two non-secret values as repository/environment variables (not secrets, since they aren't sensitive on their own):
+- Store these as repository/environment **variables** (not secrets — none of these are sensitive on their own):
   - `AGENT_BLUEPRINT_APP_ID`
   - `AGENT_BLUEPRINT_OBJECT_ID`
+  - `TENANT_ID`
+  - `AGENT_SPONSOR_GROUP_ID` — the M365 group created in Step 1.1 (or a dedicated per-identity sponsor group, if your org wants finer-grained accountability than "same group as the blueprint"). **Required** — agent identity creation fails with `No sponsor specified. Please provide at least one sponsor.` without it.
+- Create a GitHub **Environment** named to match whatever the FIC trusts (e.g. `production`) — see the immutable-claims note in Step 1.3 if the repo was created on/after July 15, 2026, since that changes what the FIC actually matches on.
 - Grant the workflow `id-token: write` permission so it can request a GitHub OIDC token.
 - If IAM only issued a client secret (no FIC), store it as an encrypted GitHub secret, e.g. `AGENT_BLUEPRINT_SECRET`, and swap the token step below accordingly.
 
@@ -236,14 +288,16 @@ permissions:
   contents: read
 
 env:
-  TENANT_ID: <your-tenant-id>
+  TENANT_ID: ${{ vars.TENANT_ID }}
   BLUEPRINT_APP_ID: ${{ vars.AGENT_BLUEPRINT_APP_ID }}
+  BLUEPRINT_OBJECT_ID: ${{ vars.AGENT_BLUEPRINT_OBJECT_ID }}
+  AGENT_SPONSOR_GROUP_ID: ${{ vars.AGENT_SPONSOR_GROUP_ID }}
   GRAPH_BASE: https://graph.microsoft.com
 
 jobs:
   register-agent:
     runs-on: ubuntu-latest
-    environment: production   # must match the FIC 'subject' IAM configured
+    environment: production   # must match the FIC IAM configured (subject or claimsMatchingExpression)
     steps:
 
       - name: Get GitHub OIDC token
@@ -265,6 +319,10 @@ jobs:
             -d "client_assertion=${{ steps.idtoken.outputs.idtoken }}" \
             -d "grant_type=client_credentials")
           TOKEN=$(echo "$RESP" | jq -r '.access_token')
+          if [ "$TOKEN" = "null" ] || [ -z "$TOKEN" ]; then
+            echo "::error::Token exchange failed. Response: $RESP"
+            exit 1
+          fi
           echo "::add-mask::$TOKEN"
           echo "token=$TOKEN" >> "$GITHUB_OUTPUT"
 
@@ -276,12 +334,21 @@ jobs:
             -H "OData-Version: 4.0" \
             -H "Content-Type: application/json" \
             -H "Authorization: Bearer ${{ steps.blueprinttoken.outputs.token }}" \
-            -d '{
-                  "displayName": "Contoso Sales Assistant Agent",
-                  "agentIdentityBlueprintId": "'"${BLUEPRINT_APP_ID}"'"
-                }')
+            -d "$(jq -n \
+                  --arg displayName "Contoso Sales Assistant Agent" \
+                  --arg blueprintId "$BLUEPRINT_APP_ID" \
+                  --arg sponsorId "$AGENT_SPONSOR_GROUP_ID" \
+                  '{
+                    displayName: $displayName,
+                    agentIdentityBlueprintId: $blueprintId,
+                    "sponsors@odata.bind": ["https://graph.microsoft.com/v1.0/groups/" + $sponsorId]
+                  }')")
           echo "$RESP"
           IDENTITY_ID=$(echo "$RESP" | jq -r '.id')
+          if [ "$IDENTITY_ID" = "null" ] || [ -z "$IDENTITY_ID" ]; then
+            echo "::error::Agent identity creation failed. Response: $RESP"
+            exit 1
+          fi
           echo "identity_id=$IDENTITY_ID" >> "$GITHUB_OUTPUT"
 
       - name: Register the agent card (bring it online in the Agent 365 registry)
@@ -290,34 +357,55 @@ jobs:
             "${GRAPH_BASE}/beta/copilot/agentRegistrations" \
             -H "Content-Type: application/json" \
             -H "Authorization: Bearer ${{ steps.blueprinttoken.outputs.token }}" \
-            -d '{
-                  "displayName": "Contoso Sales Assistant Agent",
-                  "description": "Assists reps with CRM lookups and quote generation",
-                  "createdBy": "'"${BLUEPRINT_APP_ID}"'",
-                  "sourceCreatedDateTime": "'"$(date -u +%Y-%m-%dT%H:%M:%SZ)"'",
-                  "sourceLastModifiedDateTime": "'"$(date -u +%Y-%m-%dT%H:%M:%SZ)"'",
-                  "agentIdentityId": "'"${{ steps.createidentity.outputs.identity_id }}"'",
-                  "agentIdentityBlueprintId": "'"${AGENT_BLUEPRINT_OBJECT_ID}"'",
-                  "agentCard": {
-                    "name": "Contoso Sales Assistant Agent",
-                    "version": "1.0.0",
-                    "description": "Assists reps with CRM lookups and quote generation",
-                    "provider": "Contoso",
-                    "capabilities": { "streaming": false, "pushNotifications": false },
-                    "defaultInputModes": ["text"],
-                    "defaultOutputModes": ["text"],
-                    "skills": [
-                      { "id": "crm-lookup", "name": "CRM Lookup", "description": "Look up customer and deal records" }
-                    ]
-                  }
-                }'
+            -d "$(jq -n \
+                  --arg name "Contoso Sales Assistant Agent" \
+                  --arg desc "Assists reps with CRM lookups, email, calendar invites, and Teams notifications" \
+                  --arg blueprintId "$BLUEPRINT_APP_ID" \
+                  --arg blueprintObjectId "$BLUEPRINT_OBJECT_ID" \
+                  --arg identityId "${{ steps.createidentity.outputs.identity_id }}" \
+                  --arg now "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+                  '{
+                    displayName: $name,
+                    description: $desc,
+                    createdBy: $blueprintId,
+                    sourceCreatedDateTime: $now,
+                    sourceLastModifiedDateTime: $now,
+                    agentIdentityId: $identityId,
+                    agentIdentityBlueprintId: $blueprintObjectId,
+                    agentCard: {
+                      name: $name,
+                      version: "1.0.0",
+                      description: $desc,
+                      provider: "Contoso",
+                      capabilities: { streaming: false, pushNotifications: false },
+                      defaultInputModes: ["text"],
+                      defaultOutputModes: ["text"],
+                      skills: [
+                        { id: "crm-lookup", name: "CRM Lookup", description: "Look up customer and deal records" },
+                        { id: "email", name: "Email", description: "Read and send email on behalf of the agent" },
+                        { id: "calendar", name: "Calendar", description: "Send calendar invites" },
+                        { id: "teams-notify", name: "Teams Notifications", description: "Send Teams activity notifications" }
+                      ]
+                    }
+                  }')"
 ```
 
 **Notes on the workflow:**
-- No client secret appears anywhere — the trust chain is entirely GitHub OIDC → FIC on the blueprint → Graph token. This is what actually delivers the separation of duties: the developer's pipeline can *only* do what the blueprint's inherited permissions (set by IAM in Step 1.5) and consent (Step 1.7) allow.
-- If IAM only gave you a secret instead of a FIC, replace the two token steps with a single `client_credentials` + `client_secret` call against the same token endpoint.
+- No client secret appears anywhere — the trust chain is entirely GitHub OIDC → FIC on the blueprint → Graph token. This is what actually delivers the separation of duties: the developer's pipeline can *only* do what the blueprint's inherited permissions (set by IAM in Step 1.5) and consent allow.
+- If IAM only gave you a secret instead of a FIC, replace the token-exchange step with a single `client_credentials` + `client_secret` call against the same token endpoint.
 - Both Graph calls used above are **`/beta`** — expect breaking changes and don't treat this as a supported production dependency without a compatibility check against current docs before you rely on it long-term.
-- `AgentRegistration.ReadWrite.All` is the least-privileged permission the agent registration call needs — confirm it's included in what IAM granted in Step 1.7.
+- `AgentRegistration.ReadWrite.All` is the least-privileged permission the agent registration call needs — confirm it's included in what IAM granted in Step 1.5.
+- **JSON payloads are built with `jq -n` rather than hand-quoted strings.** Interpolating multiple shell variables into a manually-quoted JSON string is fragile — a single misplaced quote produces `BadRequest: Unable to read JSON request payload` with no indication of where the break is. `jq -n` with `--arg` handles escaping correctly and is worth using for any payload with more than one variable.
+- Every step that expects an ID from the response (`access_token`, `id`) checks for `null`/empty and fails fast with the raw response in the log — without this, a failed upstream call silently produces `Bearer null` or `agentIdentityBlueprintId: null` on the *next* step, which is a much more confusing error to debug than the real one.
+
+### 2.3 — Verify the agent identity was created
+
+```http
+GET https://graph.microsoft.com/v1.0/servicePrincipals/microsoft.graph.agentIdentity?$filter=agentIdentityBlueprintId eq '<blueprint-app-id>'&$select=id,displayName,createdDateTime,accountEnabled
+Authorization: Bearer <token>
+```
+
+Filters on the blueprint's **`appId`** (client ID), not its object ID. If the filtered query errors rather than returning results, add `ConsistencyLevel: eventual` as a header and `&$count=true` to the URL — some directory-object filter queries require it. Confirm in Entra too: **Agents → Agent identities**, or the blueprint's own **Linked agent identities** tab.
 
 ---
 
@@ -330,7 +418,7 @@ jobs:
 | Client secret (fallback) | IAM | Only via vault, ideally unused |
 | Inheritable permissions | IAM | No |
 | Tenant-wide consent | Global Admin | No |
-| Agent identity (child object) | Developer's pipeline, using blueprint token | Yes — this is the only object the developer's code creates |
+| Agent identity (child object) | Developer's pipeline, using blueprint token | Yes — this is the only object the developer's code creates (requires a pre-existing sponsor group ID, supplied as a repo variable — the pipeline doesn't create the sponsor group itself) |
 | Agent registration / card | Developer's pipeline | Yes |
 
 The developer's blast radius is capped at exactly what the blueprint was pre-authorized to do; they can't widen scope, add credentials, or grant themselves new permissions from the pipeline.
