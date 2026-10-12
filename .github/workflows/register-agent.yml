@@ -4,6 +4,9 @@ on:
   workflow_dispatch:
   push:
     branches: [main]
+    paths-ignore:   # docs-only changes shouldn't create another agent identity
+      - '**.md'
+      - 'docs/**'
 
 permissions:
   id-token: write   # required to request the GitHub OIDC token
