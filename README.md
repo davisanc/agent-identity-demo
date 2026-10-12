@@ -2,7 +2,7 @@
 
 This demo shows that an enterprise's **IAM team can create agent blueprints and hand only the blueprint ID to engineering, who then create agent identities themselves**. It works end to end on Microsoft Entra Agent ID and Agent 365, and engineering never gets identity privileges or credentials.
 
-**The blocker it solves.** Most guidance assumes one person runs `a365 setup all` end to end. That is Option 2 in the Agent 365 RACI, and it puts blueprint creation and credentials in the developer's hands. Customers with a strict security model can't allow that. This repo proves **Option 1, centralized provisioning**, works: IAM owns every security-sensitive object, and the engineering pipeline can only use what IAM pre-authorized.
+**The blocker it solves.** Most guidance assumes one person runs `a365 setup all` end to end, which puts blueprint creation and credentials in the developer's hands. Customers with a strict security model can't allow that. This repo proves **centralized provisioning** works: IAM owns every security-sensitive object, and the engineering pipeline can only use what IAM pre-authorized.
 
 This repo is the **engineering side**: a GitHub Actions workflow. The **IAM side** is a step-by-step runbook: [docs/option1-agent-provisioning-runbook.md](./docs/option1-agent-provisioning-runbook.md). The sample agent is a "Contoso Sales Assistant" with email, calendar and Teams skills.
 
@@ -46,9 +46,9 @@ The trust between the two teams is a **federated identity credential (FIC)**, no
 
 ## When to use this model
 
-Use Option 1 whenever the IAM team says engineering must not create or hold identity objects. That's typically regulated industries, central identity governance teams, and anyone who rejects a developer running `a365 setup all`.
+Use the centralized model whenever the IAM team says engineering must not create or hold identity objects. That's typically regulated industries, central identity governance teams, and anyone who rejects a developer running `a365 setup all`.
 
-| | Option 1: Centralized (this repo) | Option 2: Developer self-service |
+| | Centralized (this repo) | Developer self-service (`a365` CLI) |
 | --- | --- | --- |
 | Who creates the blueprint and credentials | IAM, through Graph or the Entra admin center | Developer, through the `a365` CLI |
 | What engineering receives | Blueprint IDs only | The Agent ID Developer role |
